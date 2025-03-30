@@ -1,0 +1,39 @@
+[project]
+name = "lstm-pyt"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "gtts>=2.5.4",
+    "mediapipe>=0.10.21",
+    "nbconvert>=7.16.6",
+    "numpy>=1.26.4",
+    "opencv-python>=4.11.0.86",
+    "opencv-python-headless>=4.11.0.86",
+    "pandas>=2.2.3",
+    "pygame>=2.6.1",
+    "pyttsx3>=2.98",
+    "streamlit>=1.44.0",
+    "torch>=2.6.0",
+    "torchvision>=0.21.0",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=6.29.5",
+    "uv>=0.6.2",
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu126", marker = "sys_platform == 'win32'" },
+]
+torchvision = [
+  { index = "pytorch-cu126", marker = "sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
