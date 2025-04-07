@@ -1,373 +1,625 @@
 import streamlit as st
-import cv2
-import numpy as np
 import torch
-import torch.nn as nn
+import cv2
 import mediapipe as mp
-import os
+import numpy as np
 import time
-from gtts import gTTS
-import tempfile
-import pygame
-from threading import Thread
-from PIL import Image
+from collections import deque
+import threading
+from utils import ImprovedGestureLSTM
 
-# Set page configuration
-st.set_page_config(page_title="Hand Sign Recognition", page_icon="👋", layout="wide")
-
-# Initialize pygame for audio playback
-pygame.mixer.init()
-
-# Function to speak text using gTTS (Google Text-to-Speech)
-def speak_text(text):
-    try:
-        # Create a temporary file for the speech audio
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as f:
-            tts = gTTS(text=text, lang='en')
-            temp_filename = f.name
-            tts.save(temp_filename)
-        
-        # Play the audio in a non-blocking way
-        def play_audio():
-            pygame.mixer.music.load(temp_filename)
-            pygame.mixer.music.play()
-            # Wait for playback to finish
-            while pygame.mixer.music.get_busy():
-                pygame.time.Clock().tick(10)
-            # Clean up the temporary file
-            try:
-                os.unlink(temp_filename)
-            except:
-                pass
-        
-        # Start audio playback in a separate thread
-        Thread(target=play_audio).start()
-    except Exception as e:
-        st.warning(f"Speech error: {e}")
-
-# Initialize for tracking speech cooldown
-if "last_speech_time" not in st.session_state:
-    st.session_state.last_speech_time = 0
-
-# Define the LSTM model class (same as in the notebook)
-class GestureLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, num_classes):
-        super(GestureLSTM, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-        self.dropout = nn.Dropout(0.3)
-        self.fc = nn.Linear(hidden_size, num_classes)
-
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        out = out[:, -1, :]  # Select output at final time step
-        out = self.dropout(out)
-        out = self.fc(out)
-        return out
-
-
-# Function to extract keypoints using MediaPipe
-def extract_keypoints(frame, hands):
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = hands.process(frame_rgb)
-    if results.multi_hand_landmarks:
-        landmarks = results.multi_hand_landmarks[0]
-        keypoints = []
-        for lm in landmarks.landmark:
-            keypoints.extend([lm.x, lm.y, lm.z])
-        return np.array(keypoints), results.multi_hand_landmarks
-    return None, None
-
-
-# Streamlit UI
-st.title("Real-time Hand Sign Recognition")
-st.markdown(
-    "This application recognizes hand signs using a trained LSTM model and your webcam."
+# Page configuration
+st.set_page_config(
+    page_title="Indian Sign Language Recognition",
+    page_icon="👐",
+    layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
-# Sidebar for configuration
-st.sidebar.header("Configuration")
-confidence_threshold = st.sidebar.slider("Confidence Threshold", 0.0, 1.0, 0.7, 0.05)
-show_landmarks = st.sidebar.checkbox("Show Hand Landmarks", True)
-show_fps = st.sidebar.checkbox("Show FPS", True)
-enable_speech = st.sidebar.checkbox("Enable Speech Output", True)
-speech_cooldown = st.sidebar.slider("Speech Cooldown (seconds)", 1, 5, 2)
 
-# Initialize session state if it doesn't exist
-if "previous_threshold" not in st.session_state:
-    st.session_state.previous_threshold = confidence_threshold
+# Class for real-time sign language detection
+class SignLanguageApp:
+    def __init__(
+        self,
+        model_path="models/ISL_holistic_best.pt",
+        sequence_length=30,
+        threshold=0.7,
+    ):
+        # Set device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Initialize camera in session state if needed
-if "camera" not in st.session_state:
-    st.session_state.camera = None
+        # Load model
+        self.load_model(model_path)
 
-# Initialize for keeping track of last spoken prediction
-if "last_spoken_prediction" not in st.session_state:
-    st.session_state.last_spoken_prediction = ""
+        # Initialize MediaPipe
+        self.mp_holistic = mp.solutions.holistic
+        self.mp_drawing = mp.solutions.drawing_utils
+        self.mp_drawing_styles = mp.solutions.drawing_styles
+        self.holistic = self.mp_holistic.Holistic(
+            min_detection_confidence=0.5, min_tracking_confidence=0.5
+        )
 
-# Model loading section
-@st.cache_resource
-def load_model():
-    # Define model parameters
-    input_size = 63  # 21 landmarks * 3 coordinates (x, y, z)
-    hidden_size = 64
-    num_layers = 2
-    num_classes = 3  # Update based on your model
+        # Initialize sequence parameters
+        self.sequence_length = sequence_length
+        self.threshold = threshold
+        self.sequence_buffer = []
 
-    # Label mapping
-    label_map = {0: "bye", 1: "hello", 2: "thankyou"}
+        # For prediction smoothing and tracking
+        self.prediction_history = deque(maxlen=5)
+        self.current_prediction = None
+        self.last_spoken_prediction = None
 
-    # Device configuration
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # For feature calculation
+        self.previous_result = None
 
-    # Initialize and load model
-    model = GestureLSTM(input_size, hidden_size, num_layers, num_classes)
-    model_path = os.path.join("models", "gesture_model.pt")
+        # For UI and visualization
+        self.frame_placeholder = None
+        self.status_placeholder = None
+        self.confidence_bar = None
+        self.prediction_text = None
 
-    if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        model.to(device)
-        model.eval()
-        return model, device, label_map
-    else:
-        return None, device, label_map
+        # For sentence building
+        self.last_added_word = None
+        self.last_added_time = 0
 
+        # For detection control
+        self.is_running = False
+        self.stop_event = threading.Event()
 
-# Load the model
-model, device, label_map = load_model()
+    def load_model(self, model_path):
+        """Load the trained model from checkpoint"""
+        try:
+            self.checkpoint = torch.load(model_path, map_location=self.device)
 
-if model is None:
-    st.error(
-        "Model file not found. Please make sure the model is in the correct location."
-    )
-    st.stop()
-else:
-    st.sidebar.success("Model loaded successfully!")
+            # Get label mapping
+            self.label2idx = self.checkpoint["label2idx"]
+            self.idx2label = self.checkpoint["idx2label"]
 
-# Initialize MediaPipe Hands
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
+            # Create model
+            input_size = 354  # Match your training feature dimension
+            hidden_size = 128
+            num_layers = 2
+            num_classes = len(self.idx2label)
 
-
-# Function to initialize or reinitialize the hands object
-@st.cache_resource(hash_funcs={float: lambda x: x})
-def initialize_hands(threshold):
-    # Close previous hands instance if it exists
-    if "hands" in st.session_state and st.session_state.hands:
-        st.session_state.hands.close()
-
-    hands = mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=1,
-        min_detection_confidence=threshold,
-    )
-    st.session_state.hands = hands
-    return hands
-
-
-# Function to safely release camera
-def release_camera():
-    if st.session_state.camera is not None:
-        st.session_state.camera.release()
-        st.session_state.camera = None
-
-
-# Function to safely initialize camera
-def init_camera():
-    # Release any existing camera first
-    release_camera()
-
-    try:
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            return None
-
-        # Test if camera works by reading a frame
-        ret, _ = cap.read()
-        if not ret:
-            cap.release()
-            return None
-
-        st.session_state.camera = cap
-        return cap
-    except Exception as e:
-        st.error(f"Camera initialization error: {e}")
-        return None
-
-
-# Initialize or reinitialize the hands object if the threshold has changed
-if st.session_state.previous_threshold != confidence_threshold:
-    st.session_state.previous_threshold = confidence_threshold
-    hands = initialize_hands(confidence_threshold)
-    # Also reinitialize camera when threshold changes
-    release_camera()
-else:
-    hands = initialize_hands(confidence_threshold)
-
-# Create a placeholder for the webcam feed
-video_placeholder = st.empty()
-info_placeholder = st.empty()
-status_placeholder = st.empty()
-
-# Initialize sequence buffer
-sequence = []
-sequence_length = 30
-prediction_text = "Waiting for hand gestures..."
-confidence = 0.0
-
-# Start the webcam
-cap = init_camera()
-
-if cap is None:
-    st.error(
-        """
-    Failed to access the webcam. Please try:
-    1. Refreshing the page
-    2. Checking if another application is using the camera
-    3. Verifying browser camera permissions
-    4. Restarting your computer
-    """
-    )
-    st.stop()
-
-# Main application loop
-try:
-    prev_time = time.time()
-
-    while cap.isOpened():
-        # Check if configuration has changed during loop execution
-        if st.session_state.previous_threshold != confidence_threshold:
-            # If changed, safely release resources and break loop
-            release_camera()
-            break
-
-        # Read frame from webcam
-        ret, frame = cap.read()
-        if not ret:
-            # Try to recover by reinitializing camera
-            cap = init_camera()
-            if cap is None:
-                st.error("Camera connection lost and could not be restored.")
-                break
-            continue
-
-        # Flip the frame horizontally for a more intuitive view
-        frame = cv2.flip(frame, 1)
-
-        # Calculate FPS
-        current_time = time.time()
-        fps = 1 / (current_time - prev_time)
-        prev_time = current_time
-
-        # Extract keypoints and draw landmarks
-        keypoints_result, hand_landmarks = extract_keypoints(frame, hands)
-
-        # Draw hand landmarks if enabled
-        if hand_landmarks and show_landmarks:
-            for hand_landmark in hand_landmarks:
-                mp_drawing.draw_landmarks(
-                    frame,
-                    hand_landmark,
-                    mp_hands.HAND_CONNECTIONS,
-                    mp_drawing.DrawingSpec(
-                        color=(121, 22, 76), thickness=2, circle_radius=4
-                    ),
-                    mp_drawing.DrawingSpec(
-                        color=(250, 44, 250), thickness=2, circle_radius=2
-                    ),
-                )
-
-        # Process keypoints for prediction
-        if keypoints_result is not None:
-            sequence.append(keypoints_result)
-            if len(sequence) > sequence_length:
-                sequence.pop(0)
-
-        # When we have enough frames, perform inference
-        if len(sequence) == sequence_length:
-            input_seq = np.array(sequence)
-            input_tensor = (
-                torch.tensor(input_seq, dtype=torch.float32).unsqueeze(0).to(device)
+            self.model = ImprovedGestureLSTM(
+                input_size=input_size,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                num_classes=num_classes,
             )
 
+            # Load model weights
+            self.model.load_state_dict(self.checkpoint["model_state_dict"])
+            self.model.to(self.device)
+            self.model.eval()
+
+            st.sidebar.success(f"Model loaded successfully with {num_classes} classes.")
+
+        except Exception as e:
+            st.sidebar.error(f"Error loading model: {e}")
+            st.stop()
+
+    def extract_keypoints(self, results):
+        """Extract keypoints from MediaPipe results"""
+        # Extract left hand landmarks
+        lh = (
+            np.zeros(63)
+            if results.left_hand_landmarks is None
+            else np.array(
+                [[lm.x, lm.y, lm.z] for lm in results.left_hand_landmarks.landmark]
+            ).flatten()
+        )
+
+        # Extract right hand landmarks
+        rh = (
+            np.zeros(63)
+            if results.right_hand_landmarks is None
+            else np.array(
+                [[lm.x, lm.y, lm.z] for lm in results.right_hand_landmarks.landmark]
+            ).flatten()
+        )
+
+        # Extract pose landmarks (upper body only)
+        upper_body_indices = [0, 11, 12, 13, 14, 15, 16, 23, 24]
+        pose = np.zeros(len(upper_body_indices) * 3)
+
+        if results.pose_landmarks:
+            landmarks = results.pose_landmarks.landmark
+            for i, idx in enumerate(upper_body_indices):
+                if idx < len(landmarks):
+                    pose[i * 3 : (i * 3) + 3] = [
+                        landmarks[idx].x,
+                        landmarks[idx].y,
+                        landmarks[idx].z,
+                    ]
+
+        # Calculate relative positions
+        relative_features = []
+
+        if results.pose_landmarks and (
+            results.left_hand_landmarks or results.right_hand_landmarks
+        ):
+            # Reference points (shoulders)
+            left_shoulder = (
+                np.array([landmarks[11].x, landmarks[11].y, landmarks[11].z])
+                if 11 < len(landmarks)
+                else np.zeros(3)
+            )
+            right_shoulder = (
+                np.array([landmarks[12].x, landmarks[12].y, landmarks[12].z])
+                if 12 < len(landmarks)
+                else np.zeros(3)
+            )
+
+            # Hand center points (if detected)
+            if results.left_hand_landmarks:
+                left_hand_center = np.mean(
+                    np.array(
+                        [
+                            [lm.x, lm.y, lm.z]
+                            for lm in results.left_hand_landmarks.landmark
+                        ]
+                    ),
+                    axis=0,
+                )
+                relative_features.extend(left_hand_center - left_shoulder)
+            else:
+                relative_features.extend(np.zeros(3))
+
+            if results.right_hand_landmarks:
+                right_hand_center = np.mean(
+                    np.array(
+                        [
+                            [lm.x, lm.y, lm.z]
+                            for lm in results.right_hand_landmarks.landmark
+                        ]
+                    ),
+                    axis=0,
+                )
+                relative_features.extend(right_hand_center - right_shoulder)
+            else:
+                relative_features.extend(np.zeros(3))
+
+            # Distance between hands (if both detected)
+            if results.left_hand_landmarks and results.right_hand_landmarks:
+                hand_distance = right_hand_center - left_hand_center
+                relative_features.extend(hand_distance)
+            else:
+                relative_features.extend(np.zeros(3))
+        else:
+            # Add placeholder zeros if landmarks aren't detected
+            relative_features = np.zeros(9)
+
+        # Base features
+        base_features = np.concatenate([lh, rh, pose, relative_features])
+
+        # Calculate velocity features if we have a previous frame
+        if self.previous_result is not None:
+            previous_features = self.extract_base_keypoints(self.previous_result)
+            velocity_features = base_features - previous_features
+        else:
+            velocity_features = np.zeros_like(base_features)
+
+        # Extract hand shape dynamics
+        shape_features = self.extract_hand_shape_features(results)
+
+        # Additional features to match dimensions
+        additional_features = np.zeros(
+            354 - len(base_features) - len(velocity_features) - len(shape_features)
+        )
+
+        # Combine all features
+        features = np.concatenate(
+            [base_features, velocity_features, shape_features, additional_features]
+        )
+
+        # Update previous result for next frame
+        self.previous_result = results
+
+        # Ensure exactly 354 dimensions
+        assert features.shape[0] == 354, (
+            f"Feature dimension mismatch: {features.shape[0]} != 354"
+        )
+
+        return features
+
+    def extract_base_keypoints(self, results):
+        """Extract base keypoints for velocity calculation"""
+        # Extract left hand landmarks
+        lh = (
+            np.zeros(63)
+            if results.left_hand_landmarks is None
+            else np.array(
+                [[lm.x, lm.y, lm.z] for lm in results.left_hand_landmarks.landmark]
+            ).flatten()
+        )
+
+        # Extract right hand landmarks
+        rh = (
+            np.zeros(63)
+            if results.right_hand_landmarks is None
+            else np.array(
+                [[lm.x, lm.y, lm.z] for lm in results.right_hand_landmarks.landmark]
+            ).flatten()
+        )
+
+        # Extract pose landmarks
+        upper_body_indices = [0, 11, 12, 13, 14, 15, 16, 23, 24]
+        pose = np.zeros(len(upper_body_indices) * 3)
+
+        if results.pose_landmarks:
+            landmarks = results.pose_landmarks.landmark
+            for i, idx in enumerate(upper_body_indices):
+                if idx < len(landmarks):
+                    pose[i * 3 : (i * 3) + 3] = [
+                        landmarks[idx].x,
+                        landmarks[idx].y,
+                        landmarks[idx].z,
+                    ]
+
+        # Calculate relative positions
+        relative_features = []
+
+        if results.pose_landmarks and (
+            results.left_hand_landmarks or results.right_hand_landmarks
+        ):
+            left_shoulder = (
+                np.array([landmarks[11].x, landmarks[11].y, landmarks[11].z])
+                if 11 < len(landmarks)
+                else np.zeros(3)
+            )
+            right_shoulder = (
+                np.array([landmarks[12].x, landmarks[12].y, landmarks[12].z])
+                if 12 < len(landmarks)
+                else np.zeros(3)
+            )
+
+            if results.left_hand_landmarks:
+                left_hand_center = np.mean(
+                    np.array(
+                        [
+                            [lm.x, lm.y, lm.z]
+                            for lm in results.left_hand_landmarks.landmark
+                        ]
+                    ),
+                    axis=0,
+                )
+                relative_features.extend(left_hand_center - left_shoulder)
+            else:
+                relative_features.extend(np.zeros(3))
+
+            if results.right_hand_landmarks:
+                right_hand_center = np.mean(
+                    np.array(
+                        [
+                            [lm.x, lm.y, lm.z]
+                            for lm in results.right_hand_landmarks.landmark
+                        ]
+                    ),
+                    axis=0,
+                )
+                relative_features.extend(right_hand_center - right_shoulder)
+            else:
+                relative_features.extend(np.zeros(3))
+
+            if results.left_hand_landmarks and results.right_hand_landmarks:
+                hand_distance = right_hand_center - left_hand_center
+                relative_features.extend(hand_distance)
+            else:
+                relative_features.extend(np.zeros(3))
+        else:
+            relative_features = np.zeros(9)
+
+        return np.concatenate([lh, rh, pose, relative_features])
+
+    def extract_hand_shape_features(self, results):
+        """Extract features related to hand shape configuration"""
+        shape_features = []
+
+        # For right hand
+        if results.right_hand_landmarks:
+            landmarks = results.right_hand_landmarks.landmark
+
+            # Calculate finger spread
+            fingertips = [4, 8, 12, 16, 20]
+            fingertip_positions = [
+                np.array([landmarks[idx].x, landmarks[idx].y, landmarks[idx].z])
+                for idx in fingertips
+            ]
+
+            finger_spread = 0
+            for i in range(len(fingertips) - 1):
+                finger_spread += np.linalg.norm(
+                    fingertip_positions[i] - fingertip_positions[i + 1]
+                )
+
+            # Thumb-index pinch distance
+            thumb_tip = np.array([landmarks[4].x, landmarks[4].y, landmarks[4].z])
+            index_tip = np.array([landmarks[8].x, landmarks[8].y, landmarks[8].z])
+            pinch_distance = np.linalg.norm(thumb_tip - index_tip)
+
+            shape_features.extend([finger_spread, pinch_distance])
+        else:
+            shape_features.extend([0, 0])
+
+        # For left hand
+        if results.left_hand_landmarks:
+            landmarks = results.left_hand_landmarks.landmark
+
+            fingertips = [4, 8, 12, 16, 20]
+            fingertip_positions = [
+                np.array([landmarks[idx].x, landmarks[idx].y, landmarks[idx].z])
+                for idx in fingertips
+            ]
+
+            finger_spread = 0
+            for i in range(len(fingertips) - 1):
+                finger_spread += np.linalg.norm(
+                    fingertip_positions[i] - fingertip_positions[i + 1]
+                )
+
+            thumb_tip = np.array([landmarks[4].x, landmarks[4].y, landmarks[4].z])
+            index_tip = np.array([landmarks[8].x, landmarks[8].y, landmarks[8].z])
+            pinch_distance = np.linalg.norm(thumb_tip - index_tip)
+
+            shape_features.extend([finger_spread, pinch_distance])
+        else:
+            shape_features.extend([0, 0])
+
+        return np.array(shape_features)
+
+    def draw_landmarks(self, frame, results):
+        """Draw MediaPipe landmarks on the frame"""
+        # Draw pose connections
+        self.mp_drawing.draw_landmarks(
+            frame,
+            results.pose_landmarks,
+            self.mp_holistic.POSE_CONNECTIONS,
+            landmark_drawing_spec=self.mp_drawing_styles.get_default_pose_landmarks_style(),
+        )
+
+        # Draw hand connections
+        self.mp_drawing.draw_landmarks(
+            frame,
+            results.left_hand_landmarks,
+            self.mp_holistic.HAND_CONNECTIONS,
+            landmark_drawing_spec=self.mp_drawing_styles.get_default_hand_landmarks_style(),
+        )
+
+        self.mp_drawing.draw_landmarks(
+            frame,
+            results.right_hand_landmarks,
+            self.mp_holistic.HAND_CONNECTIONS,
+            landmark_drawing_spec=self.mp_drawing_styles.get_default_hand_landmarks_style(),
+        )
+
+    def smooth_prediction(self, prediction_idx, confidence):
+        """Apply temporal smoothing to predictions"""
+        if confidence > self.threshold:
+            self.prediction_history.append(prediction_idx)
+
+            # Return the most common prediction from the recent history
+            if len(self.prediction_history) > 2:
+                # Count occurrences of each prediction
+                prediction_counts = {}
+                for pred in self.prediction_history:
+                    if pred in prediction_counts:
+                        prediction_counts[pred] += 1
+                    else:
+                        prediction_counts[pred] = 1
+
+                # Find the most common prediction
+                most_common_pred = max(prediction_counts, key=prediction_counts.get)
+                return most_common_pred, self.idx2label[most_common_pred]
+
+        # If confidence is too low or not enough history
+        if len(self.prediction_history) > 0:
+            last_pred = self.prediction_history[-1]
+            return last_pred, self.idx2label[last_pred]
+
+        # Default if no predictions yet
+        return -1, "Waiting..."
+
+    def set_current_word(self, word):
+        """Add recognized word to the current sentence"""
+
+        # Only add if it's a new word and not "Waiting..." and enough time has passed
+        if (
+            word != self.last_added_word
+            and word != "Waiting..."
+            and word != "Low confidence"
+        ):
+            self.current_word = word
+
+            # Update the sentence display
+            if self.sentence_placeholder:
+                self.sentence_placeholder.markdown(
+                    f"**Current Word:** {self.current_word}"
+                )
+        else:
+            self.current_word = f"Waiting... -- {word}"
+
+    def process_frame(self, frame):
+        """Process a single frame for sign language detection"""
+        # Convert to RGB for MediaPipe
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Process with MediaPipe
+        results = self.holistic.process(frame_rgb)
+
+        # Draw landmarks if detected
+        if (
+            results.pose_landmarks
+            or results.left_hand_landmarks
+            or results.right_hand_landmarks
+        ):
+            self.draw_landmarks(frame, results)
+
+            # Extract features
+            features = self.extract_keypoints(results)
+
+            # Add to sequence buffer
+            self.sequence_buffer.append(features)
+            if len(self.sequence_buffer) > self.sequence_length:
+                self.sequence_buffer.pop(0)
+
+        # Update buffer fullness indicator
+        buffer_fullness = len(self.sequence_buffer) / self.sequence_length
+        if self.buffer_indicator:
+            self.buffer_indicator.progress(buffer_fullness)
+
+        # Make prediction when buffer is full
+        if len(self.sequence_buffer) == self.sequence_length:
+            # Convert buffer to tensor
+            sequence = np.array(self.sequence_buffer)
+            sequence_tensor = (
+                torch.tensor(sequence, dtype=torch.float32).unsqueeze(0).to(self.device)
+            )
+
+            # Get model prediction
             with torch.no_grad():
-                output = model(input_tensor)
-                probabilities = torch.nn.functional.softmax(output, dim=1)[0]
-                predicted_idx = torch.argmax(output, dim=1).item()
-                confidence = probabilities[predicted_idx].item()
+                outputs, attention_weights = self.model(sequence_tensor)
+                probs = torch.nn.functional.softmax(outputs, dim=1)[0]
 
-                if confidence > confidence_threshold:
-                    current_prediction = label_map[predicted_idx]
-                    prediction_text = f"Gesture: {current_prediction}"
-                    
-                    # Speak the prediction if enabled and conditions are met
-                    current_time = time.time()
-                    time_since_last_speech = current_time - st.session_state.last_speech_time
-                    
-                    if (enable_speech and 
-                        current_prediction != st.session_state.last_spoken_prediction and
-                        time_since_last_speech > speech_cooldown):
-                        
-                        speak_text(f"{current_prediction}")
-                        st.session_state.last_spoken_prediction = current_prediction
-                        st.session_state.last_speech_time = current_time
-                else:
-                    prediction_text = "Confidence too low"
-                    # Don't reset last_spoken_prediction here to avoid rapid toggling
+                # Get highest probability prediction
+                predicted_idx = torch.argmax(probs).item()
+                confidence = probs[predicted_idx].item()
 
-        # Display prediction on frame
+                # Apply smoothing
+                final_idx, prediction = self.smooth_prediction(
+                    predicted_idx, confidence
+                )
+
+                # Update UI with prediction
+                if self.prediction_text:
+                    self.prediction_text.markdown(f"## Prediction: **{prediction}**")
+
+                if self.confidence_bar:
+                    self.confidence_bar.progress(confidence)
+
+                # Add to sentence if confidence is high enough
+                if confidence > self.threshold:
+                    self.set_current_word(prediction)
+
+                self.current_prediction = prediction
+
+        # Add text overlay to frame
+        buffer_text = f"Frames: {len(self.sequence_buffer)}/{self.sequence_length}"
         cv2.putText(
             frame,
-            f"{prediction_text} ({confidence:.2f})",
+            buffer_text,
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 255, 0),
+            0.7,
+            (255, 255, 255),
             2,
         )
 
-        # Show FPS if enabled
-        if show_fps:
-            cv2.putText(
-                frame,
-                f"FPS: {fps:.1f}",
-                (10, 70),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 0, 255),
-                2,
+        return frame
+
+    def start_webcam(self):
+        """Start the webcam capture and processing loop"""
+        self.is_running = True
+        self.stop_event.clear()
+
+        # Initialize the webcam
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            st.error("Could not open webcam!")
+            return
+
+        # Create UI placeholders for updates
+        frame_col, info_col = st.columns([2, 1])
+
+        with frame_col:
+            self.frame_placeholder = st.empty()
+            self.buffer_indicator = st.progress(0)
+
+        with info_col:
+            self.prediction_text = st.empty()
+            st.markdown("### Confidence")
+            self.confidence_bar = st.progress(0)
+            st.markdown("### Current Word")
+            self.sentence_placeholder = st.empty()
+            self.sentence_placeholder.markdown("**Current Word:** ")
+
+        # Main webcam loop
+        while cap.isOpened() and self.is_running and not self.stop_event.is_set():
+            ret, frame = cap.read()
+            if not ret:
+                st.error("Failed to capture frame from webcam!")
+                break
+
+            # Flip for mirror effect
+            frame = cv2.flip(frame, 1)
+
+            # Process the frame
+            processed_frame = self.process_frame(frame)
+
+            # Convert to RGB for display in Streamlit
+            processed_frame_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+
+            # Update the frame placeholder
+            self.frame_placeholder.image(
+                processed_frame_rgb, channels="RGB", use_container_width=True
             )
 
-        # Convert to RGB for display in Streamlit
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Sleep to avoid overwhelming CPU
+            time.sleep(0.01)
 
-        # Display the frame
-        video_placeholder.image(rgb_frame, channels="RGB", use_container_width=True)
+        # Release resources
+        cap.release()
+        self.holistic.close()
+        self.is_running = False
 
-        # Display info about sequence progress
-        info_placeholder.info(f"Collected frames: {len(sequence)}/{sequence_length}")
+    def stop_webcam(self):
+        """Stop the webcam capture"""
+        self.stop_event.set()
+        self.is_running = False
 
-        # Add a small delay to reduce CPU usage
-        time.sleep(0.01)
 
-except Exception as e:
-    st.error(f"Error: {e}")
-finally:
-    # Release resources safely
-    release_camera()
-    if "hands" in st.session_state and st.session_state.hands:
-        st.session_state.hands.close()
-    st.write("Camera stopped.")
+def main():
+    # Set up the sidebar
+    st.sidebar.title("Indian Sign Language Recognition")
 
-# Add instructions at the bottom
-st.markdown(
-    """
-### Instructions
-1. Make sure your hand is clearly visible in the camera view
-2. Perform one of the gestures: 'hello', 'bye', or 'thankyou'
-3. Hold the gesture steady for a few seconds
-4. The prediction will appear on the video feed
+    # Application modes - simplified
+    app_mode = st.sidebar.selectbox(
+        "Choose the app mode", ["Live Recognition", "About"]
+    )
 
-### About
-This application uses a trained LSTM neural network to recognize hand signs in real-time.
-"""
-)
+    # Initialize the sign language app
+    sign_app = SignLanguageApp()
+
+    if app_mode == "Live Recognition":
+        st.markdown("# Live Sign Language Recognition")
+
+        # Start/stop webcam buttons
+        col1, col2 = st.columns(2)
+        with col1:
+            start_button = st.button("Start Webcam")
+        with col2:
+            stop_button = st.button("Stop Webcam")
+
+        if start_button:
+            sign_app.start_webcam()
+
+        if stop_button:
+            sign_app.stop_webcam()
+
+    elif app_mode == "About":
+        st.markdown("# About This Project")
+        st.markdown("""
+        ## Indian Sign Language Recognition System
+        
+        This application uses computer vision and deep learning to recognize Indian Sign Language gestures in real-time.
+        
+        ### Technology Stack:
+        - **Frontend**: Streamlit
+        - **Computer Vision**: MediaPipe for hand and pose tracking
+        - **Machine Learning**: PyTorch LSTM with attention mechanism
+        - **Text-to-Speech**: pyttsx3
+        """)
+
+
+if __name__ == "__main__":
+    main()

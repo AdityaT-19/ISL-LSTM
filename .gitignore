@@ -9,3 +9,9 @@ wheels/
 # Virtual environments
 .venv
 data
+data.bak
+data.ench
+
+
+*.bak
+*.enc

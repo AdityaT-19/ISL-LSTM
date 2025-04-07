@@ -1,0 +1,13 @@
+              precision    recall  f1-score   support
+
+         bye       1.00      0.91      0.95        32
+       hello       0.95      0.97      0.96        37
+     namaste       1.00      1.00      1.00        35
+    practice       0.94      1.00      0.97        33
+       sorry       0.95      1.00      0.97        36
+    thankyou       1.00      1.00      1.00        40
+     welcome       1.00      0.95      0.97        39
+
+    accuracy                           0.98       252
+   macro avg       0.98      0.98      0.98       252
+weighted avg       0.98      0.98      0.98       252

@@ -6,17 +6,19 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "gtts>=2.5.4",
-    "mediapipe>=0.10.21",
+    "mediapipe",
     "nbconvert>=7.16.6",
     "numpy>=1.26.4",
     "opencv-python>=4.11.0.86",
-    "opencv-python-headless>=4.11.0.86",
     "pandas>=2.2.3",
     "pygame>=2.6.1",
     "pyttsx3>=2.98",
+    "scikit-learn>=1.6.1",
+    "seaborn>=0.13.2",
     "streamlit>=1.44.0",
     "torch>=2.6.0",
     "torchvision>=0.21.0",
+    "tqdm>=4.67.1",
 ]
 
 [dependency-groups]
@@ -37,3 +39,6 @@ torchvision = [
 name = "pytorch-cu126"
 url = "https://download.pytorch.org/whl/cu126"
 explicit = true
+
+[tool.ruff]
+extend-include = ["*.ipynb"]
