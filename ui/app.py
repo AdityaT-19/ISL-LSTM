@@ -6,620 +6,490 @@ import numpy as np
 import time
 from collections import deque
 import threading
-from utils import ImprovedGestureLSTM
+import pyttsx3
+import tempfile
+import pygame
+import os
+import shutil
+from utils import ImprovedGestureLSTM # Assuming your model and feature extraction are here
 
-# Page configuration
+# --- Constants ---
+DEFAULT_MODEL_PATH = "models/ISL_holistic_best.pt"
+DEFAULT_SEQUENCE_LENGTH = 30
+DEFAULT_THRESHOLD = 0.7
+INPUT_SIZE = 354  # IMPORTANT: Must match your model's expected input size
+HIDDEN_SIZE = 128 # Example, adjust if your model differs
+NUM_LAYERS = 2    # Example, adjust if your model differs
+
+# --- Page Configuration ---
 st.set_page_config(
-    page_title="Indian Sign Language Recognition",
+    page_title="Sign Language Recognition",
     page_icon="👐",
     layout="wide",
-    initial_sidebar_state="collapsed",
 )
 
+# --- TTS Manager ---
+class TTSManager:
+    def __init__(self):
+        self.tts_engine = None
+        self.pygame_initialized = False
+        self.temp_dir = tempfile.mkdtemp()
+        self.last_spoken_word = None
+        self._init_engine()
 
-# Class for real-time sign language detection
-class SignLanguageApp:
-    def __init__(
-        self,
-        model_path="models/ISL_holistic_best.pt",
-        sequence_length=30,
-        threshold=0.7,
-    ):
-        # Set device
+    def _init_engine(self):
+        try:
+            self.tts_engine = pyttsx3.init()
+            self.tts_engine.setProperty("rate", 150)
+            self.tts_engine.setProperty("volume", 1.0)
+            pygame.init()
+            pygame.mixer.init()
+            self.pygame_initialized = True
+            print("TTS engine initialized.")
+        except Exception as e:
+            st.sidebar.warning(f"TTS/Pygame init failed: {e}. Audio disabled.")
+            self.tts_engine = None
+            self.pygame_initialized = False
+
+    def speak(self, text):
+        if not self.tts_engine or not self.pygame_initialized:
+            return
+        if text in ["Waiting...", ""] or text == self.last_spoken_word:
+            return
+        if pygame.mixer.music.get_busy(): # Don't interrupt current speech
+            return
+
+        try:
+            temp_file = os.path.join(self.temp_dir, f"speech_{hash(text)}.wav")
+            if not os.path.exists(temp_file):
+                self.tts_engine.save_to_file(text, temp_file)
+                self.tts_engine.runAndWait()
+                time.sleep(0.05) # Allow file write
+
+            if os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
+                pygame.mixer.music.load(temp_file)
+                pygame.mixer.music.play()
+                self.last_spoken_word = text
+                print(f"TTS: Spoke '{text}'") # Debugging
+            else:
+                print(f"TTS Warning: Failed to generate/find {temp_file}")
+        except Exception as e:
+            print(f"TTS Error in speak: {e}")
+            if "mixer system not initialized" in str(e):
+                self.pygame_initialized = False
+
+    def cleanup(self):
+        if self.pygame_initialized:
+            pygame.mixer.quit()
+            pygame.quit()
+            self.pygame_initialized = False
+        try:
+            if os.path.exists(self.temp_dir):
+                shutil.rmtree(self.temp_dir)
+                print("TTS temp directory cleaned.")
+        except Exception as e:
+            print(f"Error cleaning TTS temp directory: {e}")
+
+# --- Sign Prediction Backend ---
+class SignPredictor:
+    def __init__(self, model_path, sequence_length):
+        self.model_path = model_path
+        self.sequence_length = sequence_length
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Load model
-        self.load_model(model_path)
+        # Model & Labels
+        self.model = None
+        self.label2idx = None
+        self.idx2label = None
+        self.num_classes = 0
 
-        # Initialize MediaPipe
+        # MediaPipe
         self.mp_holistic = mp.solutions.holistic
         self.mp_drawing = mp.solutions.drawing_utils
         self.mp_drawing_styles = mp.solutions.drawing_styles
-        self.holistic = self.mp_holistic.Holistic(
-            min_detection_confidence=0.5, min_tracking_confidence=0.5
-        )
+        self.holistic = self.mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
-        # Initialize sequence parameters
-        self.sequence_length = sequence_length
-        self.threshold = threshold
-        self.sequence_buffer = []
+        # Processing State
+        self.sequence_buffer = deque(maxlen=self.sequence_length)
+        self.previous_result = None # For potential velocity calculation
 
-        # For prediction smoothing and tracking
-        self.prediction_history = deque(maxlen=5)
-        self.current_prediction = None
-        self.last_spoken_prediction = None
-
-        # For feature calculation
-        self.previous_result = None
-
-        # For UI and visualization
-        self.frame_placeholder = None
-        self.status_placeholder = None
-        self.confidence_bar = None
-        self.prediction_text = None
-
-        # For sentence building
-        self.last_added_word = None
-        self.last_added_time = 0
-
-        # For detection control
+        # Threading Control
         self.is_running = False
         self.stop_event = threading.Event()
+        self.processing_thread = None
 
-    def load_model(self, model_path):
-        """Load the trained model from checkpoint"""
+        # Latest Results (for main thread access)
+        self.latest_frame = None
+        self.latest_prediction = "Stopped"
+        self.latest_confidence = 0.0
+
+        self._load_model()
+
+    def _load_model(self):
         try:
-            self.checkpoint = torch.load(model_path, map_location=self.device)
+            if not os.path.exists(self.model_path):
+                raise FileNotFoundError(f"Model file not found at: {self.model_path}")
+            checkpoint = torch.load(self.model_path, map_location=self.device)
+            self.label2idx = checkpoint["label2idx"]
+            self.idx2label = checkpoint["idx2label"]
+            self.num_classes = len(self.idx2label)
 
-            # Get label mapping
-            self.label2idx = self.checkpoint["label2idx"]
-            self.idx2label = self.checkpoint["idx2label"]
-
-            # Create model
-            input_size = 354  # Match your training feature dimension
-            hidden_size = 128
-            num_layers = 2
-            num_classes = len(self.idx2label)
-
+            # Ensure these match your saved model's architecture
             self.model = ImprovedGestureLSTM(
-                input_size=input_size,
-                hidden_size=hidden_size,
-                num_layers=num_layers,
-                num_classes=num_classes,
+                input_size=INPUT_SIZE,
+                hidden_size=HIDDEN_SIZE,
+                num_layers=NUM_LAYERS,
+                num_classes=self.num_classes,
             )
-
-            # Load model weights
-            self.model.load_state_dict(self.checkpoint["model_state_dict"])
+            self.model.load_state_dict(checkpoint["model_state_dict"])
             self.model.to(self.device)
             self.model.eval()
-
-            st.sidebar.success(f"Model loaded successfully with {num_classes} classes.")
-
+            print(f"Model loaded successfully ({self.num_classes} classes).")
         except Exception as e:
-            st.sidebar.error(f"Error loading model: {e}")
-            st.stop()
+            st.error(f"Error loading model: {e}")
+            self.model = None # Ensure model is None if loading fails
 
-    def extract_keypoints(self, results):
-        """Extract keypoints from MediaPipe results"""
-        # Extract left hand landmarks
-        lh = (
-            np.zeros(63)
-            if results.left_hand_landmarks is None
-            else np.array(
-                [[lm.x, lm.y, lm.z] for lm in results.left_hand_landmarks.landmark]
-            ).flatten()
-        )
+    def _extract_base_keypoints(self, results):
+        """Extract base keypoints for velocity calculation (matches training)."""
+        # Extract left hand landmarks (63 features)
+        lh = np.zeros(63)
+        if results.left_hand_landmarks:
+             lh = np.array([[lm.x, lm.y, lm.z] for lm in results.left_hand_landmarks.landmark]).flatten()
 
-        # Extract right hand landmarks
-        rh = (
-            np.zeros(63)
-            if results.right_hand_landmarks is None
-            else np.array(
-                [[lm.x, lm.y, lm.z] for lm in results.right_hand_landmarks.landmark]
-            ).flatten()
-        )
+        # Extract right hand landmarks (63 features)
+        rh = np.zeros(63)
+        if results.right_hand_landmarks:
+             rh = np.array([[lm.x, lm.y, lm.z] for lm in results.right_hand_landmarks.landmark]).flatten()
 
-        # Extract pose landmarks (upper body only)
+        # Extract pose landmarks (upper body only - 9 landmarks * 3 coords = 27 features)
         upper_body_indices = [0, 11, 12, 13, 14, 15, 16, 23, 24]
         pose = np.zeros(len(upper_body_indices) * 3)
-
         if results.pose_landmarks:
             landmarks = results.pose_landmarks.landmark
             for i, idx in enumerate(upper_body_indices):
                 if idx < len(landmarks):
-                    pose[i * 3 : (i * 3) + 3] = [
-                        landmarks[idx].x,
-                        landmarks[idx].y,
-                        landmarks[idx].z,
-                    ]
+                    pose[i*3:(i*3)+3] = [landmarks[idx].x, landmarks[idx].y, landmarks[idx].z]
 
-        # Calculate relative positions
-        relative_features = []
-
-        if results.pose_landmarks and (
-            results.left_hand_landmarks or results.right_hand_landmarks
-        ):
+        # Calculate relative positions (9 features)
+        relative_features = np.zeros(9)
+        if results.pose_landmarks and (results.left_hand_landmarks or results.right_hand_landmarks):
+            landmarks = results.pose_landmarks.landmark # Re-access pose landmarks
             # Reference points (shoulders)
-            left_shoulder = (
-                np.array([landmarks[11].x, landmarks[11].y, landmarks[11].z])
-                if 11 < len(landmarks)
-                else np.zeros(3)
-            )
-            right_shoulder = (
-                np.array([landmarks[12].x, landmarks[12].y, landmarks[12].z])
-                if 12 < len(landmarks)
-                else np.zeros(3)
-            )
+            left_shoulder = np.array([landmarks[11].x, landmarks[11].y, landmarks[11].z]) if 11 < len(landmarks) else np.zeros(3)
+            right_shoulder = np.array([landmarks[12].x, landmarks[12].y, landmarks[12].z]) if 12 < len(landmarks) else np.zeros(3)
 
-            # Hand center points (if detected)
+            # Hand center points relative to shoulders
             if results.left_hand_landmarks:
-                left_hand_center = np.mean(
-                    np.array(
-                        [
-                            [lm.x, lm.y, lm.z]
-                            for lm in results.left_hand_landmarks.landmark
-                        ]
-                    ),
-                    axis=0,
-                )
-                relative_features.extend(left_hand_center - left_shoulder)
-            else:
-                relative_features.extend(np.zeros(3))
+                left_hand_center = np.mean(np.array([[lm.x, lm.y, lm.z] for lm in results.left_hand_landmarks.landmark]), axis=0)
+                relative_features[0:3] = left_hand_center - left_shoulder
+            # else: keep zeros
 
             if results.right_hand_landmarks:
-                right_hand_center = np.mean(
-                    np.array(
-                        [
-                            [lm.x, lm.y, lm.z]
-                            for lm in results.right_hand_landmarks.landmark
-                        ]
-                    ),
-                    axis=0,
-                )
-                relative_features.extend(right_hand_center - right_shoulder)
-            else:
-                relative_features.extend(np.zeros(3))
+                right_hand_center = np.mean(np.array([[lm.x, lm.y, lm.z] for lm in results.right_hand_landmarks.landmark]), axis=0)
+                relative_features[3:6] = right_hand_center - right_shoulder
+            # else: keep zeros
 
             # Distance between hands (if both detected)
             if results.left_hand_landmarks and results.right_hand_landmarks:
-                hand_distance = right_hand_center - left_hand_center
-                relative_features.extend(hand_distance)
-            else:
-                relative_features.extend(np.zeros(3))
+                # Need centers calculated above
+                if np.any(relative_features[0:3]) and np.any(relative_features[3:6]): # Check if centers were calculated
+                     hand_distance = (relative_features[3:6] + right_shoulder) - (relative_features[0:3] + left_shoulder) # Recalculate absolute distance
+                     relative_features[6:9] = hand_distance
+            # else: keep zeros
+        # else: keep zeros
+
+        # Total base features = 63 + 63 + 27 + 9 = 162
+        return np.concatenate([lh, rh, pose, relative_features])
+
+    def _extract_hand_shape_features(self, results):
+        """Extract features related to hand shape configuration (matches training)."""
+        shape_features = [] # List to store features
+
+        # For right hand (2 features)
+        if results.right_hand_landmarks:
+            landmarks = results.right_hand_landmarks.landmark
+            fingertips = [4, 8, 12, 16, 20] # Thumb, index, middle, ring, pinky
+            fingertip_positions = [np.array([landmarks[idx].x, landmarks[idx].y, landmarks[idx].z]) for idx in fingertips]
+
+            finger_spread = 0
+            for i in range(len(fingertips)-1):
+                finger_spread += np.linalg.norm(fingertip_positions[i] - fingertip_positions[i+1])
+
+            thumb_tip = fingertip_positions[0]
+            index_tip = fingertip_positions[1]
+            pinch_distance = np.linalg.norm(thumb_tip - index_tip)
+
+            shape_features.extend([finger_spread, pinch_distance])
         else:
-            # Add placeholder zeros if landmarks aren't detected
-            relative_features = np.zeros(9)
+            shape_features.extend([0.0, 0.0]) # Append zeros if no hand
 
-        # Base features
-        base_features = np.concatenate([lh, rh, pose, relative_features])
+        # For left hand (2 features)
+        if results.left_hand_landmarks:
+            landmarks = results.left_hand_landmarks.landmark
+            fingertips = [4, 8, 12, 16, 20]
+            fingertip_positions = [np.array([landmarks[idx].x, landmarks[idx].y, landmarks[idx].z]) for idx in fingertips]
 
-        # Calculate velocity features if we have a previous frame
+            finger_spread = 0
+            for i in range(len(fingertips)-1):
+                finger_spread += np.linalg.norm(fingertip_positions[i] - fingertip_positions[i+1])
+
+            thumb_tip = fingertip_positions[0]
+            index_tip = fingertip_positions[1]
+            pinch_distance = np.linalg.norm(thumb_tip - index_tip)
+
+            shape_features.extend([finger_spread, pinch_distance])
+        else:
+            shape_features.extend([0.0, 0.0]) # Append zeros if no hand
+
+        # Total shape features = 4
+        return np.array(shape_features)
+
+    def _extract_keypoints(self, results):
+        """
+        Extract keypoints from MediaPipe results matching the training notebook's logic.
+        """
+        # Base features (lh, rh, pose, relative) = 162 features
+        base_features = self._extract_base_keypoints(results)
+
+        # Calculate velocity features (162 features)
+        velocity_features = np.zeros_like(base_features)
         if self.previous_result is not None:
-            previous_features = self.extract_base_keypoints(self.previous_result)
-            velocity_features = base_features - previous_features
+            previous_base_features = self._extract_base_keypoints(self.previous_result)
+            # Ensure shapes match before subtraction
+            if previous_base_features.shape == base_features.shape:
+                velocity_features = base_features - previous_base_features
+
+        # Extract hand shape dynamics (4 features)
+        shape_features = self._extract_hand_shape_features(results)
+
+        # Combine features: 162 (base) + 162 (velocity) + 4 (shape) = 328 features
+        combined_features = np.concatenate([
+            base_features,
+            velocity_features,
+            shape_features
+        ])
+
+        # Pad to exactly INPUT_SIZE (354)
+        current_len = len(combined_features)
+        if current_len < INPUT_SIZE:
+            padding_size = INPUT_SIZE - current_len
+            padding = np.zeros(padding_size)
+            features = np.concatenate([combined_features, padding])
+        elif current_len > INPUT_SIZE:
+            # This shouldn't happen if calculations match training, but truncate as failsafe
+            features = combined_features[:INPUT_SIZE]
+            print(f"Warning: Truncated features from {current_len} to {INPUT_SIZE}")
         else:
-            velocity_features = np.zeros_like(base_features)
+            features = combined_features
 
-        # Extract hand shape dynamics
-        shape_features = self.extract_hand_shape_features(results)
+        # Final check (optional but good for debugging)
+        if features.shape[0] != INPUT_SIZE:
+             raise ValueError(f"Final feature dimension mismatch: {features.shape[0]} != {INPUT_SIZE}")
 
-        # Additional features to match dimensions
-        additional_features = np.zeros(
-            354 - len(base_features) - len(velocity_features) - len(shape_features)
-        )
-
-        # Combine all features
-        features = np.concatenate(
-            [base_features, velocity_features, shape_features, additional_features]
-        )
-
-        # Update previous result for next frame
+        # Update previous result for next frame's velocity calculation
         self.previous_result = results
-
-        # Ensure exactly 354 dimensions
-        assert features.shape[0] == 354, (
-            f"Feature dimension mismatch: {features.shape[0]} != 354"
-        )
 
         return features
 
-    def extract_base_keypoints(self, results):
-        """Extract base keypoints for velocity calculation"""
-        # Extract left hand landmarks
-        lh = (
-            np.zeros(63)
-            if results.left_hand_landmarks is None
-            else np.array(
-                [[lm.x, lm.y, lm.z] for lm in results.left_hand_landmarks.landmark]
-            ).flatten()
-        )
+    def _draw_landmarks(self, frame, results):
+        self.mp_drawing.draw_landmarks(frame, results.pose_landmarks, self.mp_holistic.POSE_CONNECTIONS, landmark_drawing_spec=self.mp_drawing_styles.get_default_pose_landmarks_style())
+        self.mp_drawing.draw_landmarks(frame, results.left_hand_landmarks, self.mp_holistic.HAND_CONNECTIONS, landmark_drawing_spec=self.mp_drawing_styles.get_default_hand_landmarks_style())
+        self.mp_drawing.draw_landmarks(frame, results.right_hand_landmarks, self.mp_holistic.HAND_CONNECTIONS, landmark_drawing_spec=self.mp_drawing_styles.get_default_hand_landmarks_style())
 
-        # Extract right hand landmarks
-        rh = (
-            np.zeros(63)
-            if results.right_hand_landmarks is None
-            else np.array(
-                [[lm.x, lm.y, lm.z] for lm in results.right_hand_landmarks.landmark]
-            ).flatten()
-        )
-
-        # Extract pose landmarks
-        upper_body_indices = [0, 11, 12, 13, 14, 15, 16, 23, 24]
-        pose = np.zeros(len(upper_body_indices) * 3)
-
-        if results.pose_landmarks:
-            landmarks = results.pose_landmarks.landmark
-            for i, idx in enumerate(upper_body_indices):
-                if idx < len(landmarks):
-                    pose[i * 3 : (i * 3) + 3] = [
-                        landmarks[idx].x,
-                        landmarks[idx].y,
-                        landmarks[idx].z,
-                    ]
-
-        # Calculate relative positions
-        relative_features = []
-
-        if results.pose_landmarks and (
-            results.left_hand_landmarks or results.right_hand_landmarks
-        ):
-            left_shoulder = (
-                np.array([landmarks[11].x, landmarks[11].y, landmarks[11].z])
-                if 11 < len(landmarks)
-                else np.zeros(3)
-            )
-            right_shoulder = (
-                np.array([landmarks[12].x, landmarks[12].y, landmarks[12].z])
-                if 12 < len(landmarks)
-                else np.zeros(3)
-            )
-
-            if results.left_hand_landmarks:
-                left_hand_center = np.mean(
-                    np.array(
-                        [
-                            [lm.x, lm.y, lm.z]
-                            for lm in results.left_hand_landmarks.landmark
-                        ]
-                    ),
-                    axis=0,
-                )
-                relative_features.extend(left_hand_center - left_shoulder)
-            else:
-                relative_features.extend(np.zeros(3))
-
-            if results.right_hand_landmarks:
-                right_hand_center = np.mean(
-                    np.array(
-                        [
-                            [lm.x, lm.y, lm.z]
-                            for lm in results.right_hand_landmarks.landmark
-                        ]
-                    ),
-                    axis=0,
-                )
-                relative_features.extend(right_hand_center - right_shoulder)
-            else:
-                relative_features.extend(np.zeros(3))
-
-            if results.left_hand_landmarks and results.right_hand_landmarks:
-                hand_distance = right_hand_center - left_hand_center
-                relative_features.extend(hand_distance)
-            else:
-                relative_features.extend(np.zeros(3))
-        else:
-            relative_features = np.zeros(9)
-
-        return np.concatenate([lh, rh, pose, relative_features])
-
-    def extract_hand_shape_features(self, results):
-        """Extract features related to hand shape configuration"""
-        shape_features = []
-
-        # For right hand
-        if results.right_hand_landmarks:
-            landmarks = results.right_hand_landmarks.landmark
-
-            # Calculate finger spread
-            fingertips = [4, 8, 12, 16, 20]
-            fingertip_positions = [
-                np.array([landmarks[idx].x, landmarks[idx].y, landmarks[idx].z])
-                for idx in fingertips
-            ]
-
-            finger_spread = 0
-            for i in range(len(fingertips) - 1):
-                finger_spread += np.linalg.norm(
-                    fingertip_positions[i] - fingertip_positions[i + 1]
-                )
-
-            # Thumb-index pinch distance
-            thumb_tip = np.array([landmarks[4].x, landmarks[4].y, landmarks[4].z])
-            index_tip = np.array([landmarks[8].x, landmarks[8].y, landmarks[8].z])
-            pinch_distance = np.linalg.norm(thumb_tip - index_tip)
-
-            shape_features.extend([finger_spread, pinch_distance])
-        else:
-            shape_features.extend([0, 0])
-
-        # For left hand
-        if results.left_hand_landmarks:
-            landmarks = results.left_hand_landmarks.landmark
-
-            fingertips = [4, 8, 12, 16, 20]
-            fingertip_positions = [
-                np.array([landmarks[idx].x, landmarks[idx].y, landmarks[idx].z])
-                for idx in fingertips
-            ]
-
-            finger_spread = 0
-            for i in range(len(fingertips) - 1):
-                finger_spread += np.linalg.norm(
-                    fingertip_positions[i] - fingertip_positions[i + 1]
-                )
-
-            thumb_tip = np.array([landmarks[4].x, landmarks[4].y, landmarks[4].z])
-            index_tip = np.array([landmarks[8].x, landmarks[8].y, landmarks[8].z])
-            pinch_distance = np.linalg.norm(thumb_tip - index_tip)
-
-            shape_features.extend([finger_spread, pinch_distance])
-        else:
-            shape_features.extend([0, 0])
-
-        return np.array(shape_features)
-
-    def draw_landmarks(self, frame, results):
-        """Draw MediaPipe landmarks on the frame"""
-        # Draw pose connections
-        self.mp_drawing.draw_landmarks(
-            frame,
-            results.pose_landmarks,
-            self.mp_holistic.POSE_CONNECTIONS,
-            landmark_drawing_spec=self.mp_drawing_styles.get_default_pose_landmarks_style(),
-        )
-
-        # Draw hand connections
-        self.mp_drawing.draw_landmarks(
-            frame,
-            results.left_hand_landmarks,
-            self.mp_holistic.HAND_CONNECTIONS,
-            landmark_drawing_spec=self.mp_drawing_styles.get_default_hand_landmarks_style(),
-        )
-
-        self.mp_drawing.draw_landmarks(
-            frame,
-            results.right_hand_landmarks,
-            self.mp_holistic.HAND_CONNECTIONS,
-            landmark_drawing_spec=self.mp_drawing_styles.get_default_hand_landmarks_style(),
-        )
-
-    def smooth_prediction(self, prediction_idx, confidence):
-        """Apply temporal smoothing to predictions"""
-        if confidence > self.threshold:
-            self.prediction_history.append(prediction_idx)
-
-            # Return the most common prediction from the recent history
-            if len(self.prediction_history) > 2:
-                # Count occurrences of each prediction
-                prediction_counts = {}
-                for pred in self.prediction_history:
-                    if pred in prediction_counts:
-                        prediction_counts[pred] += 1
-                    else:
-                        prediction_counts[pred] = 1
-
-                # Find the most common prediction
-                most_common_pred = max(prediction_counts, key=prediction_counts.get)
-                return most_common_pred, self.idx2label[most_common_pred]
-
-        # If confidence is too low or not enough history
-        if len(self.prediction_history) > 0:
-            last_pred = self.prediction_history[-1]
-            return last_pred, self.idx2label[last_pred]
-
-        # Default if no predictions yet
-        return -1, "Waiting..."
-
-    def set_current_word(self, word):
-        """Add recognized word to the current sentence"""
-
-        # Only add if it's a new word and not "Waiting..." and enough time has passed
-        if (
-            word != self.last_added_word
-            and word != "Waiting..."
-            and word != "Low confidence"
-        ):
-            self.current_word = word
-
-            # Update the sentence display
-            if self.sentence_placeholder:
-                self.sentence_placeholder.markdown(
-                    f"**Current Word:** {self.current_word}"
-                )
-        else:
-            self.current_word = f"Waiting... -- {word}"
-
-    def process_frame(self, frame):
-        """Process a single frame for sign language detection"""
-        # Convert to RGB for MediaPipe
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        # Process with MediaPipe
-        results = self.holistic.process(frame_rgb)
-
-        # Draw landmarks if detected
-        if (
-            results.pose_landmarks
-            or results.left_hand_landmarks
-            or results.right_hand_landmarks
-        ):
-            self.draw_landmarks(frame, results)
-
-            # Extract features
-            features = self.extract_keypoints(results)
-
-            # Add to sequence buffer
-            self.sequence_buffer.append(features)
-            if len(self.sequence_buffer) > self.sequence_length:
-                self.sequence_buffer.pop(0)
-
-        # Update buffer fullness indicator
-        buffer_fullness = len(self.sequence_buffer) / self.sequence_length
-        if self.buffer_indicator:
-            self.buffer_indicator.progress(buffer_fullness)
-
-        # Make prediction when buffer is full
-        if len(self.sequence_buffer) == self.sequence_length:
-            # Convert buffer to tensor
-            sequence = np.array(self.sequence_buffer)
-            sequence_tensor = (
-                torch.tensor(sequence, dtype=torch.float32).unsqueeze(0).to(self.device)
-            )
-
-            # Get model prediction
-            with torch.no_grad():
-                outputs, attention_weights = self.model(sequence_tensor)
-                probs = torch.nn.functional.softmax(outputs, dim=1)[0]
-
-                # Get highest probability prediction
-                predicted_idx = torch.argmax(probs).item()
-                confidence = probs[predicted_idx].item()
-
-                # Apply smoothing
-                final_idx, prediction = self.smooth_prediction(
-                    predicted_idx, confidence
-                )
-
-                # Update UI with prediction
-                if self.prediction_text:
-                    self.prediction_text.markdown(f"## Prediction: **{prediction}**")
-
-                if self.confidence_bar:
-                    self.confidence_bar.progress(confidence)
-
-                # Add to sentence if confidence is high enough
-                if confidence > self.threshold:
-                    self.set_current_word(prediction)
-
-                self.current_prediction = prediction
-
-        # Add text overlay to frame
-        buffer_text = f"Frames: {len(self.sequence_buffer)}/{self.sequence_length}"
-        cv2.putText(
-            frame,
-            buffer_text,
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-        )
-
-        return frame
-
-    def start_webcam(self):
-        """Start the webcam capture and processing loop"""
-        self.is_running = True
-        self.stop_event.clear()
-
-        # Initialize the webcam
+    def _processing_loop(self):
+        """Internal loop run in a background thread."""
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
-            st.error("Could not open webcam!")
+            print("Error: Could not open webcam.")
+            self.is_running = False
             return
 
-        # Create UI placeholders for updates
-        frame_col, info_col = st.columns([2, 1])
-
-        with frame_col:
-            self.frame_placeholder = st.empty()
-            self.buffer_indicator = st.progress(0)
-
-        with info_col:
-            self.prediction_text = st.empty()
-            st.markdown("### Confidence")
-            self.confidence_bar = st.progress(0)
-            st.markdown("### Current Word")
-            self.sentence_placeholder = st.empty()
-            self.sentence_placeholder.markdown("**Current Word:** ")
-
-        # Main webcam loop
-        while cap.isOpened() and self.is_running and not self.stop_event.is_set():
+        while self.is_running and not self.stop_event.is_set():
             ret, frame = cap.read()
             if not ret:
-                st.error("Failed to capture frame from webcam!")
-                break
+                print("Warning: Failed to capture frame.")
+                time.sleep(0.1)
+                continue
 
-            # Flip for mirror effect
             frame = cv2.flip(frame, 1)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_rgb.flags.writeable = False
+            results = self.holistic.process(frame_rgb)
+            frame_rgb.flags.writeable = True
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
-            # Process the frame
-            processed_frame = self.process_frame(frame)
+            current_pred = "Waiting..."
+            current_conf = 0.0
 
-            # Convert to RGB for display in Streamlit
-            processed_frame_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+            if results.pose_landmarks or results.left_hand_landmarks or results.right_hand_landmarks:
+                self._draw_landmarks(frame_bgr, results)
+                try:
+                    features = self._extract_keypoints(results)
+                    self.sequence_buffer.append(features)
 
-            # Update the frame placeholder
-            self.frame_placeholder.image(
-                processed_frame_rgb, channels="RGB", use_container_width=True
-            )
+                    if len(self.sequence_buffer) == self.sequence_length and self.model:
+                        sequence_array = np.array(self.sequence_buffer)
+                        sequence_tensor = torch.tensor(sequence_array, dtype=torch.float32).unsqueeze(0).to(self.device)
 
-            # Sleep to avoid overwhelming CPU
-            time.sleep(0.01)
+                        with torch.no_grad():
+                            outputs, _ = self.model(sequence_tensor) # Assuming model returns (outputs, attention_weights)
+                            probs = torch.nn.functional.softmax(outputs, dim=1)[0]
+                            current_conf, predicted_idx_tensor = torch.max(probs, dim=0)
+                            predicted_idx = predicted_idx_tensor.item()
+                            current_conf = current_conf.item()
+                            current_pred = self.idx2label.get(predicted_idx, "Unknown")
+                    elif len(self.sequence_buffer) < self.sequence_length:
+                         current_pred = f"Collecting... ({len(self.sequence_buffer)}/{self.sequence_length})"
 
-        # Release resources
+                except Exception as e:
+                    print(f"Error during processing: {e}")
+                    current_pred = "Error"
+                    current_conf = 0.0
+                    self.sequence_buffer.clear() # Clear buffer on error
+            else:
+                # No landmarks detected, maybe clear buffer? Or keep prediction?
+                if len(self.sequence_buffer) > 0:
+                     self.sequence_buffer.clear() # Clear if no landmarks detected after having some
+                current_pred = "No landmarks"
+                current_conf = 0.0
+
+
+            # Update shared state for the main thread
+            self.latest_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            self.latest_prediction = current_pred
+            self.latest_confidence = current_conf
+
+            time.sleep(0.01) # Small sleep to prevent high CPU
+
         cap.release()
-        self.holistic.close()
-        self.is_running = False
+        print("Processing loop stopped.")
 
-    def stop_webcam(self):
-        """Stop the webcam capture"""
-        self.stop_event.set()
-        self.is_running = False
+    def start(self):
+        if not self.is_running:
+            if not self.model:
+                 st.error("Model not loaded. Cannot start.")
+                 return
+            self.is_running = True
+            self.stop_event.clear()
+            self.sequence_buffer.clear()
+            self.latest_prediction = "Initializing..."
+            self.latest_confidence = 0.0
+            self.processing_thread = threading.Thread(target=self._processing_loop, daemon=True)
+            self.processing_thread.start()
+            print("Processing thread started.")
+        else:
+            print("Processing already running.")
 
+    def stop(self):
+        if self.is_running:
+            self.is_running = False
+            self.stop_event.set()
+            if self.processing_thread and self.processing_thread.is_alive():
+                self.processing_thread.join(timeout=2.0)
+            self.latest_prediction = "Stopped"
+            self.latest_confidence = 0.0
+            self.latest_frame = None # Clear last frame
+            print("Processing stopped.")
 
+    def cleanup(self):
+        self.stop()
+        if self.holistic:
+            try:
+                self.holistic.close()
+            except Exception as e:
+                print(f"Error closing MediaPipe: {e}")
+
+# --- Streamlit Main Application ---
 def main():
-    # Set up the sidebar
-    st.sidebar.title("Indian Sign Language Recognition")
+    st.title("Live Sign Language Recognition")
 
-    # Application modes - simplified
-    app_mode = st.sidebar.selectbox(
-        "Choose the app mode", ["Live Recognition", "About"]
-    )
+    # --- Sidebar ---
+    st.sidebar.header("Configuration")
+    confidence_threshold = st.sidebar.slider("Confidence Threshold", 0.1, 1.0, DEFAULT_THRESHOLD, 0.05)
+    tts_enabled = st.sidebar.checkbox("Enable Text-to-Speech", value=False)
 
-    # Initialize the sign language app
-    sign_app = SignLanguageApp()
+    st.sidebar.header("Controls")
+    start_pressed = st.sidebar.button("Start Webcam", key="start")
+    stop_pressed = st.sidebar.button("Stop Webcam", key="stop")
 
-    if app_mode == "Live Recognition":
-        st.markdown("# Live Sign Language Recognition")
+    # --- Initialize Backend Components in Session State ---
+    if 'predictor' not in st.session_state:
+        try:
+            # Using default path and sequence length for simplicity now
+            st.session_state.predictor = SignPredictor(DEFAULT_MODEL_PATH, DEFAULT_SEQUENCE_LENGTH)
+        except Exception as e:
+            st.error(f"Initialization failed: {e}")
+            st.stop() # Stop if predictor fails to init
 
-        # Start/stop webcam buttons
-        col1, col2 = st.columns(2)
-        with col1:
-            start_button = st.button("Start Webcam")
-        with col2:
-            stop_button = st.button("Stop Webcam")
+    if 'tts_manager' not in st.session_state:
+        st.session_state.tts_manager = TTSManager()
 
-        if start_button:
-            sign_app.start_webcam()
+    predictor = st.session_state.predictor
+    tts_manager = st.session_state.tts_manager
 
-        if stop_button:
-            sign_app.stop_webcam()
+    # --- Control Logic ---
+    if start_pressed and not predictor.is_running:
+        predictor.start()
+    if stop_pressed and predictor.is_running:
+        predictor.stop()
 
-    elif app_mode == "About":
-        st.markdown("# About This Project")
-        st.markdown("""
-        ## Indian Sign Language Recognition System
-        
-        This application uses computer vision and deep learning to recognize Indian Sign Language gestures in real-time.
-        
-        ### Technology Stack:
-        - **Frontend**: Streamlit
-        - **Computer Vision**: MediaPipe for hand and pose tracking
-        - **Machine Learning**: PyTorch LSTM with attention mechanism
-        - **Text-to-Speech**: pyttsx3
-        """)
+    # --- Main Area Layout ---
+    col1, col2 = st.columns([3, 1]) # Video column, Info column
 
+    with col1:
+        st.subheader("Live Feed")
+        frame_placeholder = st.empty()
+
+    with col2:
+        st.subheader("Prediction Info")
+        pred_text_placeholder = st.empty()
+        st.markdown("Confidence:")
+        conf_bar_placeholder = st.progress(0.0)
+        st.markdown("TTS Output:")
+        tts_word_placeholder = st.empty()
+
+    # --- UI Update Loop ---
+    last_spoken_pred = None # Track what was last sent to TTS
+
+    while True: # Streamlit reruns the script, this loop updates UI based on state
+        if predictor.is_running:
+            frame = predictor.latest_frame
+            prediction = predictor.latest_prediction
+            confidence = predictor.latest_confidence
+
+            if frame is not None:
+                frame_placeholder.image(frame, channels="RGB", use_container_width=True)
+            else:
+                 with frame_placeholder.container():
+                     st.info("Initializing feed...")
+
+            pred_text_placeholder.markdown(f"### {prediction}")
+            conf_bar_placeholder.progress(confidence)
+
+            # TTS Logic
+            tts_word_placeholder.write(f"Last Spoken: {tts_manager.last_spoken_word if tts_manager.last_spoken_word else '...'}")
+            if tts_enabled and confidence >= confidence_threshold and prediction != last_spoken_pred:
+                 # Check if prediction is a valid word (not status messages)
+                 if prediction not in ["Waiting...", "Collecting...", "Initializing...", "Error", "No landmarks", "Unknown", "Stopped"] and not prediction.startswith("Collecting"):
+                     tts_manager.speak(prediction)
+                     last_spoken_pred = prediction # Update last spoken attempt
+
+            # Check if stop was requested
+            if not predictor.is_running:
+                 break # Exit inner loop if stopped externally
+
+            time.sleep(0.03) # Yield control
+
+        else: # Not running state
+            frame_placeholder.info("Press 'Start Webcam' in the sidebar.")
+            pred_text_placeholder.markdown("### Stopped")
+            conf_bar_placeholder.progress(0.0)
+            tts_word_placeholder.write(f"Last Spoken: {tts_manager.last_spoken_word if tts_manager.last_spoken_word else '...'}")
+            break # Exit loop when stopped
+
+    # Note: Cleanup is tricky in standard Streamlit execution.
+    # The TTS temp dir might not be cleaned until the Streamlit server stops.
+    # Consider adding an explicit "Cleanup" button if needed.
 
 if __name__ == "__main__":
     main()
