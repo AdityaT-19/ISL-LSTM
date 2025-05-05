@@ -1,4 +1,3 @@
-
 # Indian Sign Language Recognition System using LSTM and MediaPipe
 
 A deep learning-based system for real-time Indian Sign Language (ISL) recognition using PyTorch, MediaPipe, and Attention-based LSTM.
@@ -185,11 +184,8 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - [Streamlit](https://streamlit.io/) for the web interface
 - [uv](https://github.com/astral-sh/uv) for Python environment management
 
-The application will open in your default web browser.
-
 ## Contact
 
 For questions or feedback, please contact:
 
 - GitHub: [AdityaT-19](https://github.com/AdityaT-19)
-
